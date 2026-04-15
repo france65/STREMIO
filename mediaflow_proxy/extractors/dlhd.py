@@ -1,543 +1,704 @@
+import hashlib
+import hmac
 import re
-import base64
+import time
 import logging
-from typing import Any, Dict, Optional
-from urllib.parse import urlparse, quote, urlunparse
 
-from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
+
+import aiohttp
+
+from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError, HttpResponse
+from mediaflow_proxy.utils.http_client import create_aiohttp_session
+from mediaflow_proxy.configs import settings
+
 
 logger = logging.getLogger(__name__)
 
+# Silenzia l'errore ConnectionResetError su Windows
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+# Default fingerprint parameters
+DEFAULT_DLHD_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"
+DEFAULT_DLHD_SCREEN_RESOLUTION = "1920x1080"
+DEFAULT_DLHD_TIMEZONE = "UTC"
+DEFAULT_DLHD_LANGUAGE = "en"
+
+
+def compute_fingerprint(
+    user_agent: str = DEFAULT_DLHD_USER_AGENT,
+    screen_resolution: str = DEFAULT_DLHD_SCREEN_RESOLUTION,
+    timezone: str = DEFAULT_DLHD_TIMEZONE,
+    language: str = DEFAULT_DLHD_LANGUAGE,
+) -> str:
+    """
+    Compute the X-Fingerprint header value.
+
+    Algorithm:
+    fingerprint = SHA256(useragent + screen_resolution + timezone + language).hex()[:16]
+
+    Args:
+        user_agent: The user agent string
+        screen_resolution: The screen resolution (e.g., "1920x1080")
+        timezone: The timezone (e.g., "UTC")
+        language: The language code (e.g., "en")
+
+    Returns:
+        The 16-character fingerprint
+    """
+    combined = f"{user_agent}{screen_resolution}{timezone}{language}"
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_key_path(resource: str, number: str, timestamp: int, fingerprint: str, secret_key: str) -> str:
+    """
+    Compute the X-Key-Path header value.
+
+    Algorithm:
+    key_path = HMAC-SHA256("resource|number|timestamp|fingerprint", secret_key).hex()[:16]
+
+    Args:
+        resource: The resource from the key URL
+        number: The number from the key URL
+        timestamp: The Unix timestamp
+        fingerprint: The fingerprint value
+        secret_key: The HMAC secret key (channel_salt)
+
+    Returns:
+        The 16-character key path
+    """
+    combined = f"{resource}|{number}|{timestamp}|{fingerprint}"
+    hmac_hash = hmac.new(secret_key.encode("utf-8"), combined.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac_hash[:16]
+
+
+def compute_key_headers(key_url: str, secret_key: str) -> tuple[int, int, str, str] | None:
+    """
+    Compute X-Key-Timestamp, X-Key-Nonce, X-Key-Path, and X-Fingerprint for a /key/ URL.
+
+    Algorithm:
+    1. Extract resource and number from URL pattern /key/{resource}/{number}
+    2. ts = Unix timestamp in seconds
+    3. hmac_hash = HMAC-SHA256(resource, secret_key).hex()
+    4. nonce = proof-of-work: find i where MD5(hmac+resource+number+ts+i)[:4] < 0x1000
+    5. fingerprint = compute_fingerprint()
+    6. key_path = HMAC-SHA256("resource|number|ts|fingerprint", secret_key).hex()[:16]
+
+    Args:
+        key_url: The key URL containing /key/{resource}/{number}
+        secret_key: The HMAC secret key (channel_salt)
+
+    Returns:
+        Tuple of (timestamp, nonce, key_path, fingerprint) or None if URL doesn't match pattern
+    """
+    # Extract resource and number from URL
+    pattern = r"/key/([^/]+)/(\d+)"
+    match = re.search(pattern, key_url)
+
+    if not match:
+        return None
+
+    resource = match.group(1)
+    number = match.group(2)
+
+    ts = int(time.time())
+
+    # Compute HMAC-SHA256
+    hmac_hash = hmac.new(secret_key.encode("utf-8"), resource.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    # Proof-of-work loop
+    nonce = 0
+    for i in range(100000):
+        combined = f"{hmac_hash}{resource}{number}{ts}{i}"
+        md5_hash = hashlib.md5(combined.encode("utf-8")).hexdigest()
+        prefix_value = int(md5_hash[:4], 16)
+
+        if prefix_value < 0x1000:  # < 4096
+            nonce = i
+            break
+
+    fingerprint = compute_fingerprint()
+    key_path = compute_key_path(resource, number, ts, fingerprint, secret_key)
+
+    return ts, nonce, key_path, fingerprint
+
 
 class DLHDExtractor(BaseExtractor):
-    """DLHD (DaddyLive) URL extractor for M3U8 streams."""
+    """DLHD (DaddyLive) URL extractor for M3U8 streams.
+
+    Supports the new authentication flow with:
+    - EPlayerAuth extraction (auth_token, channel_key, channel_salt)
+    - Server lookup for dynamic server selection
+    - Dynamic key header computation for AES-128 encrypted streams
+    """
 
     def __init__(self, request_headers: dict):
         super().__init__(request_headers)
-        # Default to HLS proxy endpoint
-        self.mediaflow_endpoint = "hls_manifest_proxy"
-        # Cache for the resolved base URL to avoid repeated network calls
-        self._cached_base_url = None
-        # Store iframe context for newkso.ru requests
-        self._iframe_context = None
+        self.mediaflow_endpoint = "hls_key_proxy"
+        self._iframe_context: Optional[str] = None
+        self._flaresolverr_cookies: Optional[str] = None
+        self._flaresolverr_user_agent: Optional[str] = None
 
-    def _get_headers_for_url(self, url: str, base_headers: dict) -> dict:
-        """Get appropriate headers for the given URL, applying newkso.ru specific headers if needed."""
-        headers = base_headers.copy()
-        
-        # Check if URL contains newkso.ru domain
-        parsed_url = urlparse(url)
-        if "newkso.ru" in parsed_url.netloc:
-            # Use iframe URL as referer if available, otherwise use the newkso domain itself
-            if self._iframe_context:
-                iframe_origin = f"https://{urlparse(self._iframe_context).netloc}"
-                newkso_headers = {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-                    'Referer': self._iframe_context,
-                    'Origin': iframe_origin
-                }
-                logger.info(f"Applied newkso.ru specific headers with iframe context for URL: {url}")
-                logger.debug(f"Headers applied: {newkso_headers}")
+    async def _fetch_via_flaresolverr(self, url: str) -> HttpResponse:
+        """Fetch a URL using FlareSolverr to bypass Cloudflare protection."""
+        if not settings.flaresolverr_url:
+            raise ExtractorError("FlareSolverr URL not configured. Set FLARESOLVERR_URL in environment.")
+
+        flaresolverr_endpoint = f"{settings.flaresolverr_url.rstrip('/')}/v1"
+        payload = {
+            "cmd": "request.get",
+            "url": url,
+            "maxTimeout": settings.flaresolverr_timeout * 1000,
+        }
+
+        logger.info(f"Using FlareSolverr to fetch: {url}")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                flaresolverr_endpoint,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=settings.flaresolverr_timeout + 10),
+            ) as response:
+                if response.status != 200:
+                    raise ExtractorError(f"FlareSolverr returned status {response.status}")
+
+                data = await response.json()
+
+        if data.get("status") != "ok":
+            raise ExtractorError(f"FlareSolverr failed: {data.get('message', 'Unknown error')}")
+
+        solution = data.get("solution", {})
+        html_content = solution.get("response", "")
+        final_url = solution.get("url", url)
+        status = solution.get("status", 200)
+
+        # Store cookies and user-agent for subsequent requests
+        cookies = solution.get("cookies", [])
+        if cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            self._flaresolverr_cookies = cookie_str
+            logger.info(f"FlareSolverr provided {len(cookies)} cookies")
+
+        user_agent = solution.get("userAgent")
+        if user_agent:
+            self._flaresolverr_user_agent = user_agent
+            logger.info(f"FlareSolverr user-agent: {user_agent}")
+
+        logger.info(f"FlareSolverr successfully bypassed Cloudflare for: {url}")
+
+        return HttpResponse(
+            status=status,
+            headers={},
+            text=html_content,
+            content=html_content.encode("utf-8", errors="replace"),
+            url=final_url,
+        )
+
+    async def _make_request(
+        self, url: str, method: str = "GET", headers: Optional[Dict] = None, use_flaresolverr: bool = False, **kwargs
+    ) -> HttpResponse:
+        """Override to disable SSL verification and optionally use FlareSolverr."""
+        # Use FlareSolverr for Cloudflare-protected pages
+        if use_flaresolverr and settings.flaresolverr_url:
+            return await self._fetch_via_flaresolverr(url)
+
+        timeout = kwargs.pop("timeout", 15)
+        kwargs.pop("retries", 3)  # consumed but not used directly
+        kwargs.pop("backoff_factor", 0.5)  # consumed but not used directly
+
+        # Merge headers
+        request_headers = self.base_headers.copy()
+        if headers:
+            request_headers.update(headers)
+
+        # Add FlareSolverr cookies if available
+        if self._flaresolverr_cookies:
+            existing_cookies = request_headers.get("Cookie", "")
+            if existing_cookies:
+                request_headers["Cookie"] = f"{existing_cookies}; {self._flaresolverr_cookies}"
             else:
-                # Fallback to newkso domain itself
-                newkso_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                newkso_headers = {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-                    'Referer': newkso_origin,
-                    'Origin': newkso_origin
-                }
-                logger.info(f"Applied newkso.ru specific headers (fallback) for URL: {url}")
-                logger.debug(f"Headers applied: {newkso_headers}")
-            
-            headers.update(newkso_headers)
-        
-        return headers
+                request_headers["Cookie"] = self._flaresolverr_cookies
 
-    async def _make_request(self, url: str, method: str = "GET", headers: dict = None, **kwargs):
-        """Override _make_request to apply newkso.ru specific headers when needed."""
-        request_headers = headers or {}
-        
-        # Apply newkso.ru specific headers if the URL contains newkso.ru
-        final_headers = self._get_headers_for_url(url, request_headers)
-        
-        return await super()._make_request(url, method, final_headers, **kwargs)
+        # Use FlareSolverr user-agent if available
+        if self._flaresolverr_user_agent:
+            request_headers["User-Agent"] = self._flaresolverr_user_agent
 
-    async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
-        """Extract DLHD stream URL and required headers (logica tvproxy adattata async, con fallback su endpoint alternativi)."""
-        from urllib.parse import urlparse, quote_plus
+        # Use create_aiohttp_session with verify=False for SSL bypass
+        async with create_aiohttp_session(url, timeout=timeout, verify=False) as (session, proxy_url):
+            async with session.request(method, url, headers=request_headers, proxy=proxy_url, **kwargs) as response:
+                content = await response.read()
+                final_url = str(response.url)
+                status = response.status
+                resp_headers = dict(response.headers)
 
-        async def get_daddylive_base_url():
-            if self._cached_base_url:
-                return self._cached_base_url
-            try:
-                resp = await self._make_request("https://daddylive.sx/")
-                # resp.url is the final URL after redirects
-                base_url = str(resp.url)
-                if not base_url.endswith('/'):
-                    base_url += '/'
-                self._cached_base_url = base_url
-                return base_url
-            except Exception:
-                # Fallback to default if request fails
-                return "https://daddylive.sx/"
+                if status >= 400:
+                    raise ExtractorError(f"HTTP error {status} while requesting {url}")
 
-        def extract_channel_id(url):
-            match_premium = re.search(r'/premium(\d+)/mono\.m3u8$', url)
-            if match_premium:
-                return match_premium.group(1)
-            # Handle both normal and URL-encoded patterns
-            match_player = re.search(r'/(?:watch|stream|cast|player)/stream-(\d+)\.php', url)
-            if match_player:
-                return match_player.group(1)
-            # Handle URL-encoded patterns like %2Fstream%2Fstream-123.php or just stream-123.php
-            match_encoded = re.search(r'(?:%2F|/)stream-(\d+)\.php', url, re.IGNORECASE)
-            if match_encoded:
-                return match_encoded.group(1)
-            # Handle direct stream- pattern without path
-            match_direct = re.search(r'stream-(\d+)\.php', url)
-            if match_direct:
-                return match_direct.group(1)
-            return None
+                return HttpResponse(
+                    status=status,
+                    headers=resp_headers,
+                    text=content.decode("utf-8", errors="replace"),
+                    content=content,
+                    url=final_url,
+                )
 
-        async def try_endpoint(baseurl, endpoint, channel_id):
-            stream_url = f"{baseurl}{endpoint}stream-{channel_id}.php"
-            daddy_origin = urlparse(baseurl).scheme + "://" + urlparse(baseurl).netloc
-            daddylive_headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-                'Referer': baseurl,
-                'Origin': daddy_origin
-            }
-            # 1. Richiesta alla pagina stream/cast/player/watch
-            resp1 = await self._make_request(stream_url, headers=daddylive_headers)
-            # 2. Estrai link Player 2
-            iframes = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>\s*<button[^>]*>\s*Player\s*2\s*</button>', resp1.text)
-            if not iframes:
-                raise ExtractorError("No Player 2 link found")
-            url2 = iframes[0]
-            url2 = baseurl + url2
-            url2 = url2.replace('//cast', '/cast')
-            daddylive_headers['Referer'] = url2
-            daddylive_headers['Origin'] = url2
-            # 3. Richiesta alla pagina Player 2
-            resp2 = await self._make_request(url2, headers=daddylive_headers)
-            # 4. Estrai iframe
-            iframes2 = re.findall(r'iframe src="([^"]*)', resp2.text)
-            if not iframes2:
-                raise ExtractorError("No iframe found in Player 2 page")
-            iframe_url = iframes2[0]
-            # Store iframe context for newkso.ru requests
-            self._iframe_context = iframe_url
-            resp3 = await self._make_request(iframe_url, headers=daddylive_headers)
-            iframe_content = resp3.text
-            # 5. Estrai parametri auth (robusto) - Handle both old and new formats
-            def extract_var_old_format(js, name):
-                # Try multiple patterns for variable extraction (old format)
-                patterns = [
-                    rf'var (?:__)?{name}\s*=\s*atob\("([^"]+)"\)',
-                    rf'var (?:__)?{name}\s*=\s*atob\(\'([^\']+)\'\)',
-                    rf'(?:var\s+)?(?:__)?{name}\s*=\s*atob\s*\(\s*["\']([^"\']+)["\']\s*\)',
-                    rf'(?:let|const)\s+(?:__)?{name}\s*=\s*atob\s*\(\s*["\']([^"\']+)["\']\s*\)'
-                ]
-                for pattern in patterns:
-                    m = re.search(pattern, js)
-                    if m:
-                        try:
-                            return base64.b64decode(m.group(1)).decode('utf-8')
-                        except Exception as decode_error:
-                            logger.warning(f"Failed to decode base64 for variable {name}: {decode_error}")
-                            continue
-                return None
-            
-            def extract_xjz_format(js):
-                """Extract parameters from the new XJZ base64-encoded JSON format."""
-                try:
-                    # Look for the XJZ variable assignment
-                    xjz_pattern = r'const\s+XJZ\s*=\s*["\']([^"\']+)["\']'
-                    match = re.search(xjz_pattern, js)
-                    if not match:
-                        return None
-                    xjz_b64 = match.group(1)
-                    import json
-                    # Decode the first base64 layer (JSON)
-                    xjz_json = base64.b64decode(xjz_b64).decode('utf-8')
-                    xjz_obj = json.loads(xjz_json)
-                    # Each value is also base64-encoded, decode each
-                    decoded = {}
-                    for k, v in xjz_obj.items():
-                        try:
-                            decoded[k] = base64.b64decode(v).decode('utf-8')
-                        except Exception as e:
-                            logger.warning(f"Failed to decode XJZ field {k}: {e}")
-                            decoded[k] = v
-                    return decoded
-                except Exception as e:
-                    logger.warning(f"Failed to extract XJZ format: {e}")
-                    return None
+    async def _extract_session_data(self, iframe_url: str, main_url: str) -> dict | None:
+        """
+        Fetch the iframe URL and extract auth_token, channel_key, and channel_salt.
 
-            def extract_bundle_format(js):
-                """Extract parameters from new BUNDLE format (legacy fallback)."""
-                try:
-                    bundle_patterns = [
-                        r'const\s+BUNDLE\s*=\s*["\']([^"\']+)["\']',
-                        r'var\s+BUNDLE\s*=\s*["\']([^"\']+)["\']',
-                        r'let\s+BUNDLE\s*=\s*["\']([^"\']+)["\']'
-                    ]
-                    bundle_data = None
-                    for pattern in bundle_patterns:
-                        match = re.search(pattern, js)
-                        if match:
-                            bundle_data = match.group(1)
-                            break
-                    if not bundle_data:
-                        return None
-                    import json
-                    bundle_json = base64.b64decode(bundle_data).decode('utf-8')
-                    bundle_obj = json.loads(bundle_json)
-                    decoded_bundle = {}
-                    for key, value in bundle_obj.items():
-                        try:
-                            decoded_bundle[key] = base64.b64decode(value).decode('utf-8')
-                        except Exception as e:
-                            logger.warning(f"Failed to decode bundle field {key}: {e}")
-                            decoded_bundle[key] = value
-                    return decoded_bundle
-                except Exception as e:
-                    logger.warning(f"Failed to extract bundle format: {e}")
-                    return None
-            
-            # Try multiple patterns for channel key extraction
-            channel_key = None
-            channel_key_patterns = [
-                r'const\s+CHANNEL_KEY\s*=\s*["\']([^"\']+)["\']',
-                r'var\s+CHANNEL_KEY\s*=\s*["\']([^"\']+)["\']',
-                r'let\s+CHANNEL_KEY\s*=\s*["\']([^"\']+)["\']',
-                r'channelKey\s*=\s*["\']([^"\']+)["\']',
-                r'var\s+channelKey\s*=\s*["\']([^"\']+)["\']',
-                r'(?:let|const)\s+channelKey\s*=\s*["\']([^"\']+)["\']'
-            ]
-            for pattern in channel_key_patterns:
-                match = re.search(pattern, iframe_content)
-                if match:
-                    channel_key = match.group(1)
-                    break
-            
-            # Try new XJZ format first
-            xjz_data = extract_xjz_format(iframe_content)
-            if xjz_data:
-                logger.info("Using new XJZ format for parameter extraction")
-                auth_host = xjz_data.get('b_host')
-                auth_php = xjz_data.get('b_script')
-                auth_ts = xjz_data.get('b_ts')
-                auth_rnd = xjz_data.get('b_rnd')
-                auth_sig = xjz_data.get('b_sig')
-                logger.debug(f"XJZ data extracted: {xjz_data}")
-            else:
-                # Try bundle format (legacy fallback)
-                bundle_data = extract_bundle_format(iframe_content)
-                if bundle_data:
-                    logger.info("Using BUNDLE format for parameter extraction")
-                    auth_host = bundle_data.get('b_host')
-                    auth_php = bundle_data.get('b_script')
-                    auth_ts = bundle_data.get('b_ts')
-                    auth_rnd = bundle_data.get('b_rnd')
-                    auth_sig = bundle_data.get('b_sig')
-                    logger.debug(f"Bundle data extracted: {bundle_data}")
-                else:
-                    logger.info("Falling back to old format for parameter extraction")
-                    # Fall back to old format
-                    auth_ts = extract_var_old_format(iframe_content, 'c')
-                    auth_rnd = extract_var_old_format(iframe_content, 'd')
-                    auth_sig = extract_var_old_format(iframe_content, 'e')
-                    auth_host = extract_var_old_format(iframe_content, 'a')
-                    auth_php = extract_var_old_format(iframe_content, 'b')
+        Args:
+            iframe_url: The iframe URL to fetch
+            main_url: The main site domain for Referer header
 
-            # Log what we found for debugging
-            logger.debug(f"Extracted parameters: channel_key={channel_key}, auth_ts={auth_ts}, auth_rnd={auth_rnd}, auth_sig={auth_sig}, auth_host={auth_host}, auth_php={auth_php}")
-
-            # Check which parameters are missing
-            missing_params = []
-            if not channel_key:
-                missing_params.append('channel_key/CHANNEL_KEY')
-            if not auth_ts:
-                missing_params.append('auth_ts (var c / b_ts)')
-            if not auth_rnd:
-                missing_params.append('auth_rnd (var d / b_rnd)')
-            if not auth_sig:
-                missing_params.append('auth_sig (var e / b_sig)')
-            if not auth_host:
-                missing_params.append('auth_host (var a / b_host)')
-            if not auth_php:
-                missing_params.append('auth_php (var b / b_script)')
-
-            if missing_params:
-                logger.error(f"Missing parameters: {', '.join(missing_params)}")
-                # Log a portion of the iframe content for debugging (first 2000 chars)
-                logger.debug(f"Iframe content sample: {iframe_content[:2000]}")
-                raise ExtractorError(f"Error extracting parameters: missing {', '.join(missing_params)}")
-            auth_sig = quote_plus(auth_sig)
-            # 6. Richiesta auth
-            # Se il sito fornisce ancora /a.php ma ora serve /auth.php, sostituisci
-            # Normalize and robustly replace any variant of a.php with /auth.php
-            if auth_php:
-                normalized_auth_php = auth_php.strip().lstrip('/')
-                if normalized_auth_php == 'a.php':
-                    logger.info("Sostituisco qualunque variante di a.php con /auth.php per compatibilità.")
-                    auth_php = '/auth.php'
-            # Unisci host e script senza doppio slash
-            if auth_host.endswith('/') and auth_php.startswith('/'):
-                auth_url = f'{auth_host[:-1]}{auth_php}'
-            elif not auth_host.endswith('/') and not auth_php.startswith('/'):
-                auth_url = f'{auth_host}/{auth_php}'
-            else:
-                auth_url = f'{auth_host}{auth_php}'
-            auth_url = f'{auth_url}?channel_id={channel_key}&ts={auth_ts}&rnd={auth_rnd}&sig={auth_sig}'
-            auth_resp = await self._make_request(auth_url, headers=daddylive_headers)
-            # 7. Lookup server - Extract host parameter
-            host = None
-            host_patterns = [
-                r'(?s)m3u8 =.*?:.*?:.*?".*?".*?"([^"]*)',  # Original pattern
-                r'm3u8\s*=.*?"([^"]*)"',  # Simplified m3u8 pattern
-                r'host["\']?\s*[:=]\s*["\']([^"\']*)',  # host: or host= pattern
-                r'["\']([^"\']*\.newkso\.ru[^"\']*)',  # Direct newkso.ru pattern
-                r'["\']([^"\']*\/premium\d+[^"\']*)',  # premium path pattern
-                r'url.*?["\']([^"\']*newkso[^"\']*)',  # URL with newkso
-            ]
-            
-            for pattern in host_patterns:
-                matches = re.findall(pattern, iframe_content)
-                if matches:
-                    host = matches[0]
-                    logger.debug(f"Found host with pattern '{pattern}': {host}")
-                    break
-            
-            if not host:
-                logger.error("Failed to extract host from iframe content")
-                logger.debug(f"Iframe content for host extraction: {iframe_content[:2000]}")
-                # Try to find any newkso.ru related URLs
-                potential_hosts = re.findall(r'["\']([^"\']*newkso[^"\']*)', iframe_content)
-                if potential_hosts:
-                    logger.debug(f"Potential host URLs found: {potential_hosts}")
-                raise ExtractorError("Failed to extract host parameter")
-            
-            # Extract server lookup URL from fetchWithRetry call (dynamic extraction)
-            server_lookup = None
-            
-            # Look for the server_lookup.php pattern in JavaScript
-            if "fetchWithRetry('/server_lookup.php?channel_id='" in iframe_content:
-                server_lookup = '/server_lookup.php?channel_id='
-                logger.debug('Found server lookup URL: /server_lookup.php?channel_id=')
-            elif '/server_lookup.php' in iframe_content:
-                # Try to extract the full path
-                js_lines = iframe_content.split('\n')
-                for js_line in js_lines:
-                    if 'server_lookup.php' in js_line and 'fetchWithRetry' in js_line:
-                        # Extract the URL from the fetchWithRetry call
-                        start = js_line.find("'")
-                        if start != -1:
-                            end = js_line.find("'", start + 1)
-                            if end != -1:
-                                potential_url = js_line[start+1:end]
-                                if 'server_lookup' in potential_url:
-                                    server_lookup = potential_url
-                                    logger.debug(f'Extracted server lookup URL: {server_lookup}')
-                                    break
-            
-            if not server_lookup:
-                logger.error('Failed to extract server lookup URL from iframe content')
-                logger.debug(f'Iframe content sample: {iframe_content[:2000]}')
-                raise ExtractorError('Failed to extract server lookup URL')
-            
-            server_lookup_url = f"https://{urlparse(iframe_url).netloc}{server_lookup}{channel_key}"
-            logger.debug(f"Server lookup URL: {server_lookup_url}")
-            
-            try:
-                lookup_resp = await self._make_request(server_lookup_url, headers=daddylive_headers)
-                server_data = lookup_resp.json()
-                server_key = server_data.get('server_key')
-                if not server_key:
-                    logger.error(f"No server_key in response: {server_data}")
-                    raise ExtractorError("Failed to get server key from lookup response")
-                
-                logger.info(f"Server lookup successful - Server key: {server_key}")
-            except Exception as lookup_error:
-                logger.error(f"Server lookup request failed: {lookup_error}")
-                raise ExtractorError(f"Server lookup failed: {str(lookup_error)}")
-            
-            referer_raw = f'https://{urlparse(iframe_url).netloc}'
-            
-            # Extract URL construction logic dynamically from JavaScript
-            # Simple approach: look for newkso.ru URLs and construct based on server_key
-            
-            # Check if we have the special case server_key
-            if server_key == 'top1/cdn':
-                clean_m3u8_url = f'https://top1.newkso.ru/top1/cdn/{channel_key}/mono.m3u8'
-                logger.info(f'Using special case URL for server_key \'top1/cdn\': {clean_m3u8_url}')
-            else:
-                clean_m3u8_url = f'https://{server_key}new.newkso.ru/{server_key}/{channel_key}/mono.m3u8'
-                logger.info(f'Using general case URL for server_key \'{server_key}\': {clean_m3u8_url}')
-            
-            logger.info(f'Generated stream URL: {clean_m3u8_url}')
-            logger.debug(f'Server key: {server_key}, Channel key: {channel_key}')
-            
-            # Check if the final stream URL is on newkso.ru domain
-            if "newkso.ru" in clean_m3u8_url:
-                # For newkso.ru streams, use iframe URL as referer
-                stream_headers = {
-                    'User-Agent': daddylive_headers['User-Agent'],
-                    'Referer': iframe_url,
-                    'Origin': referer_raw
-                }
-                logger.info(f"Applied iframe-specific headers for newkso.ru stream URL: {clean_m3u8_url}")
-                logger.debug(f"Stream headers for newkso.ru: {stream_headers}")
-            else:
-                # For other domains, use the original logic
-                stream_headers = {
-                    'User-Agent': daddylive_headers['User-Agent'],
-                    'Referer': referer_raw,
-                    'Origin': referer_raw
-                }
-            return {
-                "destination_url": clean_m3u8_url,
-                "request_headers": stream_headers,
-                "mediaflow_endpoint": self.mediaflow_endpoint,
-            }
+        Returns:
+            Dict with auth_token, channel_key, channel_salt, or None if not found
+        """
+        headers = {
+            "User-Agent": self._flaresolverr_user_agent or DEFAULT_DLHD_USER_AGENT,
+            "Referer": f"https://{main_url}/",
+        }
 
         try:
-            clean_url = url
-            channel_id = extract_channel_id(clean_url)
-            if not channel_id:
-                raise ExtractorError(f"Unable to extract channel ID from {clean_url}")
+            resp = await self._make_request(iframe_url, headers=headers, timeout=12)
+            html = resp.text
+        except Exception as e:
+            logger.warning(f"Error fetching iframe URL: {e}")
+            return None
 
-            baseurl = await get_daddylive_base_url()
-            endpoints = ["stream/", "cast/", "player/", "watch/"]
-            last_exc = None
-            for endpoint in endpoints:
-                try:
-                    return await try_endpoint(baseurl, endpoint, channel_id)
-                except Exception as exc:
-                    last_exc = exc
+        # Pattern to extract EPlayerAuth.init block with authToken, channelKey, channelSalt
+        # Matches: EPlayerAuth.init({ authToken: '...', channelKey: '...', ..., channelSalt: '...' });
+        auth_pattern = r"EPlayerAuth\.init\s*\(\s*\{\s*authToken:\s*'([^']+)'"
+        channel_key_pattern = r"channelKey:\s*'([^']+)'"
+        channel_salt_pattern = r"channelSalt:\s*'([^']+)'"
+
+        # Pattern to extract server lookup base URL from fetchWithRetry call
+        lookup_pattern = r"fetchWithRetry\s*\(\s*'([^']+server_lookup\?channel_id=)"
+
+        auth_match = re.search(auth_pattern, html)
+        channel_key_match = re.search(channel_key_pattern, html)
+        channel_salt_match = re.search(channel_salt_pattern, html)
+        lookup_match = re.search(lookup_pattern, html)
+
+        if auth_match and channel_key_match and channel_salt_match:
+            result = {
+                "auth_token": auth_match.group(1),
+                "channel_key": channel_key_match.group(1),
+                "channel_salt": channel_salt_match.group(1),
+            }
+            if lookup_match:
+                result["server_lookup_url"] = lookup_match.group(1) + result["channel_key"]
+
+            return result
+
+        return None
+
+    async def _get_server_key(self, server_lookup_url: str, iframe_url: str) -> str | None:
+        """
+        Fetch the server lookup URL and extract the server_key.
+
+        Args:
+            server_lookup_url: The server lookup URL
+            iframe_url: The iframe URL for extracting the host for headers
+
+        Returns:
+            The server_key or None if not found
+        """
+        parsed = urlparse(iframe_url)
+        iframe_host = parsed.netloc
+
+        headers = {
+            "User-Agent": self._flaresolverr_user_agent or DEFAULT_DLHD_USER_AGENT,
+            "Referer": f"https://{iframe_host}/",
+            "Origin": f"https://{iframe_host}",
+        }
+
+        try:
+            resp = await self._make_request(server_lookup_url, headers=headers, timeout=10)
+            data = resp.json()
+            return data.get("server_key")
+        except Exception as e:
+            logger.warning(f"Error fetching server lookup: {e}")
+            return None
+
+    def _build_m3u8_url(self, server_key: str, channel_key: str) -> str:
+        """
+        Build the m3u8 URL based on the server_key.
+
+        Args:
+            server_key: The server key from server lookup
+            channel_key: The channel key
+
+        Returns:
+            The m3u8 URL (with .css extension as per the original implementation)
+        """
+        if server_key == "top1/cdn":
+            return f"https://top1.dvalna.ru/top1/cdn/{channel_key}/mono.css"
+        else:
+            return f"https://{server_key}new.dvalna.ru/{server_key}/{channel_key}/mono.css"
+
+    async def _extract_new_auth_flow(self, iframe_url: str, iframe_content: str, headers: dict) -> Dict[str, Any]:
+        """Handles the new authentication flow found in recent updates."""
+
+        def _extract_params(js: str) -> Dict[str, Optional[str]]:
+            params = {}
+            patterns = {
+                "channel_key": r'(?:const|var|let)\s+(?:CHANNEL_KEY|channelKey)\s*=\s*["\']([^"\']+)["\']',
+                "auth_token": r'(?:const|var|let)\s+AUTH_TOKEN\s*=\s*["\']([^"\']+)["\']',
+                "auth_country": r'(?:const|var|let)\s+AUTH_COUNTRY\s*=\s*["\']([^"\']+)["\']',
+                "auth_ts": r'(?:const|var|let)\s+AUTH_TS\s*=\s*["\']([^"\']+)["\']',
+                "auth_expiry": r'(?:const|var|let)\s+AUTH_EXPIRY\s*=\s*["\']([^"\']+)["\']',
+            }
+            for key, pattern in patterns.items():
+                match = re.search(pattern, js)
+                params[key] = match.group(1) if match else None
+            return params
+
+        params = _extract_params(iframe_content)
+
+        missing_params = [k for k, v in params.items() if not v]
+        if missing_params:
+            # This is not an error, just means it's not the new flow
+            raise ExtractorError(f"Not the new auth flow: missing params {missing_params}")
+
+        logger.info("New auth flow detected. Proceeding with POST auth.")
+
+        # 1. Initial Auth POST
+        auth_url = "https://security.newkso.ru/auth2.php"
+
+        iframe_origin = f"https://{urlparse(iframe_url).netloc}"
+        auth_headers = headers.copy()
+        auth_headers.update(
+            {
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": iframe_origin,
+                "Referer": iframe_url,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "cross-site",
+                "Priority": "u=1, i",
+            }
+        )
+
+        # Build form data for multipart/form-data
+        form_data = aiohttp.FormData()
+        form_data.add_field("channelKey", params["channel_key"])
+        form_data.add_field("country", params["auth_country"])
+        form_data.add_field("timestamp", params["auth_ts"])
+        form_data.add_field("expiry", params["auth_expiry"])
+        form_data.add_field("token", params["auth_token"])
+
+        try:
+            async with create_aiohttp_session(auth_url, timeout=12, verify=False) as (session, proxy_url):
+                async with session.post(
+                    auth_url,
+                    headers=auth_headers,
+                    data=form_data,
+                    proxy=proxy_url,
+                ) as response:
+                    content = await response.read()
+                    response.raise_for_status()
+                    import json
+
+                    auth_data = json.loads(content.decode("utf-8"))
+                    if not (auth_data.get("valid") or auth_data.get("success")):
+                        raise ExtractorError(f"Initial auth failed with response: {auth_data}")
+            logger.info("New auth flow: Initial auth successful.")
+        except ExtractorError:
+            raise
+        except Exception as e:
+            raise ExtractorError(f"New auth flow failed during initial auth POST: {e}")
+
+        # 2. Server Lookup
+        server_lookup_url = f"https://{urlparse(iframe_url).netloc}/server_lookup.js?channel_id={params['channel_key']}"
+        try:
+            # Use _make_request as it handles retries
+            lookup_resp = await self._make_request(server_lookup_url, headers=headers, timeout=10)
+            server_data = lookup_resp.json()
+            server_key = server_data.get("server_key")
+            if not server_key:
+                raise ExtractorError(f"No server_key in lookup response: {server_data}")
+            logger.info(f"New auth flow: Server lookup successful - Server key: {server_key}")
+        except ExtractorError:
+            raise
+        except Exception as e:
+            raise ExtractorError(f"New auth flow failed during server lookup: {e}")
+
+        # 3. Build final stream URL
+        channel_key = params["channel_key"]
+        auth_token = params["auth_token"]
+        # The JS logic uses .css, not .m3u8
+        if server_key == "top1/cdn":
+            stream_url = f"https://top1.newkso.ru/top1/cdn/{channel_key}/mono.css"
+        else:
+            stream_url = f"https://{server_key}new.newkso.ru/{server_key}/{channel_key}/mono.css"
+
+        logger.info(f"New auth flow: Constructed stream URL: {stream_url}")
+
+        stream_headers = {
+            "User-Agent": headers["User-Agent"],
+            "Referer": iframe_url,
+            "Origin": iframe_origin,
+            "Authorization": f"Bearer {auth_token}",
+            "X-Channel-Key": channel_key,
+        }
+
+        return {
+            "destination_url": stream_url,
+            "request_headers": stream_headers,
+            "mediaflow_endpoint": "hls_manifest_proxy",
+        }
+
+    async def _extract_lovecdn_stream(self, iframe_url: str, iframe_content: str, headers: dict) -> Dict[str, Any]:
+        """
+        Alternative extractor for lovecdn.ru iframe that uses a different format.
+        """
+        try:
+            # Look for direct stream URL patterns
+            m3u8_patterns = [
+                r'["\']([^"\']*\.m3u8[^"\']*)["\']',
+                r'source[:\s]+["\']([^"\']+)["\']',
+                r'file[:\s]+["\']([^"\']+\.m3u8[^"\']*)["\']',
+                r'hlsManifestUrl[:\s]*["\']([^"\']+)["\']',
+            ]
+
+            stream_url = None
+            for pattern in m3u8_patterns:
+                matches = re.findall(pattern, iframe_content)
+                for match in matches:
+                    if ".m3u8" in match and match.startswith("http"):
+                        stream_url = match
+                        logger.info(f"Found direct m3u8 URL: {stream_url}")
+                        break
+                if stream_url:
+                    break
+
+            # Pattern 2: Look for dynamic URL construction
+            if not stream_url:
+                channel_match = re.search(r'(?:stream|channel)["\s:=]+["\']([^"\']+)["\']', iframe_content)
+                server_match = re.search(r'(?:server|domain|host)["\s:=]+["\']([^"\']+)["\']', iframe_content)
+
+                if channel_match:
+                    channel_name = channel_match.group(1)
+                    server = server_match.group(1) if server_match else "newkso.ru"
+                    stream_url = f"https://{server}/{channel_name}/mono.m3u8"
+                    logger.info(f"Constructed stream URL: {stream_url}")
+
+            if not stream_url:
+                # Fallback: look for any URL that looks like a stream
+                url_pattern = r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*'
+                matches = re.findall(url_pattern, iframe_content)
+                if matches:
+                    stream_url = matches[0]
+                    logger.info(f"Found fallback stream URL: {stream_url}")
+
+            if not stream_url:
+                raise ExtractorError("Could not find stream URL in lovecdn.ru iframe")
+
+            # Use iframe URL as referer
+            iframe_origin = f"https://{urlparse(iframe_url).netloc}"
+            stream_headers = {"User-Agent": headers["User-Agent"], "Referer": iframe_url, "Origin": iframe_origin}
+
+            # Determine endpoint based on the stream domain
+            endpoint = "hls_key_proxy"
+
+            logger.info(f"Using lovecdn.ru stream with endpoint: {endpoint}")
+
+            return {
+                "destination_url": stream_url,
+                "request_headers": stream_headers,
+                "mediaflow_endpoint": endpoint,
+            }
+
+        except Exception as e:
+            raise ExtractorError(f"Failed to extract lovecdn.ru stream: {e}")
+
+    async def _extract_direct_stream(self, channel_id: str) -> Dict[str, Any]:
+        """
+        Direct stream extraction using server lookup API with the new auth flow.
+        This extracts auth_token, channel_key, channel_salt and computes key headers.
+        """
+        # Common iframe domains for DLHD
+        iframe_domains = ["lefttoplay.xyz"]
+
+        for iframe_domain in iframe_domains:
+            try:
+                iframe_url = f"https://{iframe_domain}/premiumtv/daddyhd.php?id={channel_id}"
+                logger.info(f"Attempting extraction via {iframe_domain}")
+
+                session_data = await self._extract_session_data(iframe_url, "dlhd.link")
+
+                if not session_data:
+                    logger.debug(f"No session data from {iframe_domain}")
                     continue
-            raise ExtractorError(f"Extraction failed: {str(last_exc)}")
+
+                logger.info(f"Got session data from {iframe_domain}: channel_key={session_data['channel_key']}")
+
+                # Get server key
+                if "server_lookup_url" not in session_data:
+                    logger.debug(f"No server lookup URL from {iframe_domain}")
+                    continue
+
+                server_key = await self._get_server_key(session_data["server_lookup_url"], iframe_url)
+
+                if not server_key:
+                    logger.debug(f"No server key from {iframe_domain}")
+                    continue
+
+                logger.info(f"Got server key: {server_key}")
+
+                # Build m3u8 URL
+                m3u8_url = self._build_m3u8_url(server_key, session_data["channel_key"])
+                logger.info(f"M3U8 URL: {m3u8_url}")
+
+                # Build stream headers with auth
+                iframe_origin = f"https://{iframe_domain}"
+                stream_headers = {
+                    "User-Agent": self._flaresolverr_user_agent or DEFAULT_DLHD_USER_AGENT,
+                    "Referer": iframe_url,
+                    "Origin": iframe_origin,
+                    "Authorization": f"Bearer {session_data['auth_token']}",
+                }
+
+                # Return the result with key header parameters
+                # These will be used to compute headers when fetching keys
+                return {
+                    "destination_url": m3u8_url,
+                    "request_headers": stream_headers,
+                    "mediaflow_endpoint": "hls_key_proxy",
+                    # Force playlist processing since DLHD uses .css extension for m3u8
+                    "force_playlist_proxy": True,
+                    # Key header computation parameters
+                    "dlhd_key_params": {
+                        "channel_salt": session_data["channel_salt"],
+                        "auth_token": session_data["auth_token"],
+                        "iframe_url": iframe_url,
+                    },
+                }
+
+            except Exception as e:
+                logger.warning(f"Failed extraction via {iframe_domain}: {e}")
+                continue
+
+        raise ExtractorError(f"Failed to extract stream from all iframe domains for channel {channel_id}")
+
+    async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
+        """Main extraction flow - uses direct server lookup with new auth flow."""
+
+        def extract_channel_id(u: str) -> Optional[str]:
+            match_watch_id = re.search(r"watch\.php\?id=(\d+)", u)
+            if match_watch_id:
+                return match_watch_id.group(1)
+            # Also try stream-XXX pattern
+            match_stream = re.search(r"stream-(\d+)", u)
+            if match_stream:
+                return match_stream.group(1)
+            return None
+
+        try:
+            channel_id = extract_channel_id(url)
+            if not channel_id:
+                raise ExtractorError(f"Unable to extract channel ID from {url}")
+
+            logger.info(f"Extracting DLHD stream for channel ID: {channel_id}")
+
+            # Try direct stream extraction with new auth flow
+            try:
+                return await self._extract_direct_stream(channel_id)
+            except ExtractorError as e:
+                logger.warning(f"Direct stream extraction failed: {e}")
+
+            # Fallback to legacy iframe-based extraction if direct fails
+            logger.info("Falling back to iframe-based extraction...")
+            return await self._extract_via_iframe(url, channel_id)
+
         except Exception as e:
             raise ExtractorError(f"Extraction failed: {str(e)}")
 
-    async def _lookup_server(
-        self, lookup_url_base: str, auth_url_base: str, auth_data: Dict[str, str], headers: Dict[str, str]
-    ) -> str:
-        """Lookup server information and generate stream URL."""
-        try:
-            # Construct server lookup URL
-            server_lookup_url = f"{lookup_url_base}/server_lookup.php?channel_id={quote(auth_data['channel_key'])}"
+    async def _extract_via_iframe(self, url: str, channel_id: str) -> Dict[str, Any]:
+        """Legacy iframe-based extraction flow - used as fallback."""
+        baseurl = "https://dlhd.dad/"
 
-            # Make server lookup request
-            server_response = await self._make_request(server_lookup_url, headers=headers)
+        daddy_origin = urlparse(baseurl).scheme + "://" + urlparse(baseurl).netloc
+        daddylive_headers = {
+            "User-Agent": self._flaresolverr_user_agent
+            or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Referer": baseurl,
+            "Origin": daddy_origin,
+        }
 
-            server_data = server_response.json()
-            server_key = server_data.get("server_key")
+        # 1. Request initial page - use FlareSolverr if available to bypass Cloudflare
+        use_flaresolverr = settings.flaresolverr_url is not None
+        resp1 = await self._make_request(url, headers=daddylive_headers, timeout=15, use_flaresolverr=use_flaresolverr)
+        resp1_text = resp1.text
 
-            if not server_key:
-                raise ExtractorError("Failed to get server key")
+        # Update headers with FlareSolverr user-agent after initial request
+        if self._flaresolverr_user_agent:
+            daddylive_headers["User-Agent"] = self._flaresolverr_user_agent
 
-            # Extract domain parts from auth URL for constructing stream URL
-            auth_domain_parts = urlparse(auth_url_base).netloc.split(".")
-            domain_suffix = ".".join(auth_domain_parts[1:]) if len(auth_domain_parts) > 1 else auth_domain_parts[0]
+        player_links = re.findall(r'<button[^>]*data-url="([^"]+)"[^>]*>Player\s*\d+</button>', resp1_text)
+        if not player_links:
+            raise ExtractorError("No player links found on the page.")
 
-            # Generate the m3u8 URL based on server response pattern
-            if "/" in server_key:
-                # Handle special case like "top1/cdn"
-                parts = server_key.split("/")
-                return f"https://{parts[0]}.{domain_suffix}/{server_key}/{auth_data['channel_key']}/mono.m3u8"
-            else:
-                # Handle normal case
-                return f"https://{server_key}new.{domain_suffix}/{server_key}/{auth_data['channel_key']}/mono.m3u8"
+        # Try all players and collect all valid iframes
+        last_player_error = None
+        iframe_candidates = []
 
-        except Exception as e:
-            raise ExtractorError(f"Server lookup failed: {str(e)}")
+        for player_url in player_links:
+            try:
+                if not player_url.startswith("http"):
+                    player_url = baseurl + player_url.lstrip("/")
 
-    def _extract_auth_data(self, html_content: str) -> Dict[str, str]:
-        """Extract authentication data from player page."""
-        try:
-            channel_key_match = re.search(r'var\s+channelKey\s*=\s*["\']([^"\']+)["\']', html_content)
-            if not channel_key_match:
-                return {}
-            channel_key = channel_key_match.group(1)
+                daddylive_headers["Referer"] = player_url
+                daddylive_headers["Origin"] = player_url
+                resp2 = await self._make_request(player_url, headers=daddylive_headers, timeout=12)
+                resp2_text = resp2.text
+                iframes2 = re.findall(r'<iframe.*?src="([^"]*)"', resp2_text)
 
-            # New pattern with atob
-            auth_ts_match = re.search(r'var\s+__c\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
-            auth_rnd_match = re.search(r'var\s+__d\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
-            auth_sig_match = re.search(r'var\s+__e\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
+                # Collect all found iframes
+                for iframe in iframes2:
+                    if iframe not in iframe_candidates:
+                        iframe_candidates.append(iframe)
+                        logger.info(f"Found iframe candidate: {iframe}")
 
-            if auth_ts_match and auth_rnd_match and auth_sig_match:
-                return {
-                    "channel_key": channel_key,
-                    "auth_ts": base64.b64decode(auth_ts_match.group(1)).decode("utf-8"),
-                    "auth_rnd": base64.b64decode(auth_rnd_match.group(1)).decode("utf-8"),
-                    "auth_sig": base64.b64decode(auth_sig_match.group(1)).decode("utf-8"),
-                }
+            except Exception as e:
+                last_player_error = e
+                logger.warning(f"Failed to process player link {player_url}: {e}")
+                continue
 
-            # Original pattern
-            auth_ts_match = re.search(r'var\s+authTs\s*=\s*["\']([^"\']+)["\']', html_content)
-            auth_rnd_match = re.search(r'var\s+authRnd\s*=\s*["\']([^"\']+)["\']', html_content)
-            auth_sig_match = re.search(r'var\s+authSig\s*=\s*["\']([^"\']+)["\']', html_content)
+        if not iframe_candidates:
+            if last_player_error:
+                raise ExtractorError(f"All player links failed. Last error: {last_player_error}")
+            raise ExtractorError("No valid iframe found in any player page")
 
-            if auth_ts_match and auth_rnd_match and auth_sig_match:
-                return {
-                    "channel_key": channel_key,
-                    "auth_ts": auth_ts_match.group(1),
-                    "auth_rnd": auth_rnd_match.group(1),
-                    "auth_sig": auth_sig_match.group(1),
-                }
-            return {}
-        except Exception:
-            return {}
+        # Try each iframe until one works
+        last_iframe_error = None
 
-    def _extract_auth_url_base(self, html_content: str) -> Optional[str]:
-        """Extract auth URL base from player page script content."""
-        try:
-            # New atob pattern for auth base URL
-            auth_url_base_match = re.search(r'var\s+__a\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
-            if auth_url_base_match:
-                decoded_url = base64.b64decode(auth_url_base_match.group(1)).decode("utf-8")
-                return decoded_url.strip().rstrip("/")
+        for iframe_candidate in iframe_candidates:
+            try:
+                logger.info(f"Trying iframe: {iframe_candidate}")
 
-            # Look for auth URL or domain in fetchWithRetry call or similar patterns
-            auth_url_match = re.search(r'fetchWithRetry\([\'"]([^\'"]*/auth\.php)', html_content)
+                iframe_domain = urlparse(iframe_candidate).netloc
+                if not iframe_domain:
+                    logger.warning(f"Invalid iframe URL format: {iframe_candidate}")
+                    continue
 
-            if auth_url_match:
-                auth_url = auth_url_match.group(1)
-                # Extract base URL up to the auth.php part
-                return auth_url.split("/auth.php")[0]
+                self._iframe_context = iframe_candidate
+                resp3 = await self._make_request(iframe_candidate, headers=daddylive_headers, timeout=12)
+                iframe_content = resp3.text
+                logger.info(f"Successfully loaded iframe from: {iframe_domain}")
 
-            # Try finding domain directly
-            domain_match = re.search(r'[\'"]https://([^/\'\"]+)(?:/[^\'\"]*)?/auth\.php', html_content)
+                if "lovecdn.ru" in iframe_domain:
+                    logger.info("Detected lovecdn.ru iframe - using alternative extraction")
+                    return await self._extract_lovecdn_stream(iframe_candidate, iframe_content, daddylive_headers)
+                else:
+                    logger.info("Attempting new auth flow extraction.")
+                    return await self._extract_new_auth_flow(iframe_candidate, iframe_content, daddylive_headers)
 
-            if domain_match:
-                return f"https://{domain_match.group(1)}"
+            except Exception as e:
+                logger.warning(f"Failed to process iframe {iframe_candidate}: {e}")
+                last_iframe_error = e
+                continue
 
-            return None
-        except Exception:
-            return None
-
-    def _get_origin(self, url: str) -> str:
-        """Extract origin from URL."""
-        parsed = urlparse(url)
-        return f"{parsed.scheme}://{parsed.netloc}"
-
-    def _derive_auth_url_base(self, player_domain: str) -> Optional[str]:
-        """Attempt to derive auth URL base from player domain."""
-        try:
-            # Typical pattern is to use a subdomain for auth domain
-            parsed = urlparse(player_domain)
-            domain_parts = parsed.netloc.split(".")
-
-            # Get the top-level domain and second-level domain
-            if len(domain_parts) >= 2:
-                base_domain = ".".join(domain_parts[-2:])
-                # Try common subdomains for auth
-                for prefix in ["auth", "api", "cdn"]:
-                    potential_auth_domain = f"https://{prefix}.{base_domain}"
-                    return potential_auth_domain
-
-            return None
-        except Exception:
-            return None
+        raise ExtractorError(f"All iframe candidates failed. Last error: {last_iframe_error}")
